@@ -104,6 +104,8 @@ export const api = {
     invoke<string | null>("get_summary", { recordingId }),
   getRollingSummary: (recordingId: number) =>
     invoke<string | null>("get_rolling_summary", { recordingId }),
+  rerunFinalize: (recordingId: number) =>
+    invoke<void>("rerun_finalize", { recordingId }),
   detectCallApp: () => invoke<"discord" | "teams" | "none">("detect_call_app"),
   listAudioDevices: () =>
     invoke<{

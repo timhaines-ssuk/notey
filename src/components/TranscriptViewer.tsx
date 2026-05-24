@@ -81,6 +81,21 @@ export default function TranscriptViewer({
           </span>
         )}
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <button
+            onClick={async () => {
+              if (!confirm(`Re-run transcription+diarization on recording #${recordingId} using the configured finalize model? This will replace existing segments.`)) return;
+              try {
+                await api.rerunFinalize(recordingId);
+                setStage("transcribing");
+                setErr(null);
+              } catch (e) {
+                setErr(String(e));
+              }
+            }}
+            title="Re-run the big-model transcription on the stored audio"
+          >
+            Re-run transcription
+          </button>
           <button className="primary" onClick={() => setNamingOpen(true)}>Name speakers</button>
           <button onClick={() => doExport("vtt")}>Export VTT</button>
           <button onClick={() => doExport("json")}>Export JSON</button>

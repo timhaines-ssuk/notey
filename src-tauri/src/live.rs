@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const LIVE_WINDOW_SECONDS: u64 = 8;
 pub const LIVE_OVERLAP_SECONDS: u64 = 2;
@@ -67,14 +67,25 @@ pub fn spawn_live<F: Fn(crate::transcribe::TranscribedSegment) + Send + 'static>
     let stop_thread = stop.clone();
     let thread = std::thread::spawn(move || {
         let mut last_emit_end: f64 = 0.0;
-        let mut offset_seconds: f64 = 0.0;
         loop {
+            // Poll the stop flag at 100 ms intervals instead of sleeping for
+            // the full window duration. Worst-case stop latency: 100 ms here
+            // (vs ~8 s previously) + whatever the in-flight whisper call
+            // takes, which we also skip if stop fires before we enter it.
+            let deadline = Instant::now()
+                + Duration::from_secs(LIVE_WINDOW_SECONDS);
+            while Instant::now() < deadline {
+                if stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
             if stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            std::thread::sleep(Duration::from_secs(LIVE_WINDOW_SECONDS));
+
             let total_samples = buffer.len_samples();
-            offset_seconds = total_samples as f64 / buffer.sample_rate as f64
+            let mut offset_seconds = total_samples as f64 / buffer.sample_rate as f64
                 - (LIVE_WINDOW_SECONDS + LIVE_OVERLAP_SECONDS) as f64;
             if offset_seconds < 0.0 {
                 offset_seconds = 0.0;
@@ -82,6 +93,13 @@ pub fn spawn_live<F: Fn(crate::transcribe::TranscribedSegment) + Send + 'static>
             let chunk = buffer.take_recent(LIVE_WINDOW_SECONDS + LIVE_OVERLAP_SECONDS);
             if chunk.is_empty() {
                 continue;
+            }
+
+            // Final stop check just before the expensive whisper call. If
+            // the user hits Stop near a window boundary, this saves the 1-5 s
+            // whisper inference time on the way out.
+            if stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
             }
             match transcribe_chunk(&model_path, &chunk, device_index) {
                 Ok(segments) => {

@@ -263,15 +263,32 @@ export default function Studio({ onOpenRecording }: { onOpenRecording: (id: numb
               key={r.id}
               className="recording-row"
               style={{ marginBottom: 6 }}
-              onClick={() => onOpenRecording(r.id)}
             >
-              <div>
+              <div onClick={() => onOpenRecording(r.id)} style={{ flex: 1, cursor: "pointer" }}>
                 <div>{r.source_filename ?? `Recording #${r.id}`}</div>
                 <div className="meta">
                   {r.source} · {fmtDur2(r.duration_seconds)}
                 </div>
               </div>
-              <span className={`status-pill ${r.status}`}>{r.status}</span>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button
+                  title="Re-run the big-model transcription on this recording"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (!confirm(`Re-run transcription on recording #${r.id}?`)) return;
+                    try {
+                      await api.rerunFinalize(r.id);
+                      onOpenRecording(r.id); // jump to its transcript view to watch progress
+                    } catch (err) {
+                      setErr(String(err));
+                    }
+                  }}
+                  style={{ fontSize: 11, padding: "4px 8px" }}
+                >
+                  ↻ re-transcribe
+                </button>
+                <span className={`status-pill ${r.status}`}>{r.status}</span>
+              </div>
             </div>
           ))}
         </div>

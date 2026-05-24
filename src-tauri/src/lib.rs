@@ -343,10 +343,17 @@ async fn stop_call_capture(
     state: tauri::State<'_, AppState>,
 ) -> Result<i64, String> {
     // Stop the live worker first so it doesn't try to push more rows after
-    // we delete them in the finalize pass.
-    if let Some(h) = state.live_worker.lock().unwrap().take() {
-        h.stop();
+    // we delete them in the finalize pass. The join is potentially slow
+    // (up to LIVE_WINDOW_SECONDS = 8s on the previous build; ~100ms now)
+    // and we keep it on spawn_blocking either way so the Tauri tokio
+    // runtime isn't stalled while we wait.
+    let live_handle = state.live_worker.lock().unwrap().take();
+    if let Some(h) = live_handle {
+        tokio::task::spawn_blocking(move || h.stop())
+            .await
+            .map_err(|e| format!("live worker join panicked: {e}"))?;
     }
+
     let handle = state
         .capture
         .lock()
@@ -360,7 +367,10 @@ async fn stop_call_capture(
     } else {
         *state.last_capture_error.lock().unwrap() = None;
     }
-    let path = handle.stop().map_err(|e| e.to_string())?;
+    let path = tokio::task::spawn_blocking(move || handle.stop())
+        .await
+        .map_err(|e| format!("capture join panicked: {e}"))?
+        .map_err(|e| e.to_string())?;
     let rec_id = state
         .active_recording
         .lock()
@@ -443,6 +453,42 @@ async fn run_pipeline(
     set_stage(&state, "complete");
     let _ = app.emit("pipeline-stage", ("complete", rec_id));
     tracing::info!("pipeline: complete for recording {rec_id}");
+    Ok(())
+}
+
+#[tauri::command]
+async fn rerun_finalize(app: tauri::AppHandle, recording_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    // Resolve the stored audio path. If audio was already deleted (post-cleanup)
+    // we can't re-run — surface that clearly.
+    let audio_path: String = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(audio_path, '') FROM recordings WHERE id = ?1",
+            rusqlite::params![recording_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("recording {recording_id} not found: {e}"))?
+    };
+    if audio_path.is_empty() {
+        return Err(format!(
+            "recording {recording_id} has no audio_path on file — cannot re-run"
+        ));
+    }
+    let path = std::path::PathBuf::from(&audio_path);
+    if !path.exists() {
+        return Err(format!(
+            "audio file {audio_path} no longer exists (auto-deleted post-finalize, or removed manually)"
+        ));
+    }
+    let data_dir = state.data_dir.clone();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_pipeline(&app_clone, &data_dir, recording_id, &path).await {
+            tracing::error!("re-run pipeline failed for {recording_id}: {e:?}");
+            let _ = app_clone.emit("pipeline-error", format!("{recording_id}: {e:#}"));
+        }
+    });
     Ok(())
 }
 
@@ -777,6 +823,7 @@ pub fn run() {
             get_log_dir,
             get_summary,
             get_rolling_summary,
+            rerun_finalize,
             detect_call_app,
             list_audio_devices,
             list_audio_sessions,
