@@ -26,6 +26,7 @@ pub struct AppState {
     pub active_recording: Mutex<Option<i64>>,
     pub hardware_cache: Mutex<Option<hardware::HardwareProfile>>,
     pub last_capture_error: Mutex<Option<String>>,
+    pub live_worker: Mutex<Option<live::LiveHandle>>,
 }
 
 #[tauri::command]
@@ -81,21 +82,80 @@ fn confirm_speaker(
 }
 
 #[tauri::command]
-fn start_call_capture(state: tauri::State<AppState>) -> Result<i64, String> {
-    let conn = state.db.lock().unwrap();
-    let mic_name = db::get_setting(&conn, "device_mic").ok().flatten().filter(|s| !s.is_empty());
-    let loop_source = db::get_setting(&conn, "loopback_source").ok().flatten().unwrap_or_default();
-    let loop_name = db::get_setting(&conn, "device_loopback").ok().flatten().filter(|s| !s.is_empty());
-    let rec_id = db::create_call_recording(&conn, &state.data_dir).map_err(|e| e.to_string())?;
-    drop(conn);
+async fn start_call_capture(app: tauri::AppHandle) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let (mic_name, loop_source, loop_name, live_model_name, backend) = {
+        let conn = state.db.lock().unwrap();
+        let mic_name = db::get_setting(&conn, "device_mic").ok().flatten().filter(|s| !s.is_empty());
+        let loop_source = db::get_setting(&conn, "loopback_source").ok().flatten().unwrap_or_default();
+        let loop_name = db::get_setting(&conn, "device_loopback").ok().flatten().filter(|s| !s.is_empty());
+        let raw = db::get_setting(&conn, "transcribe_live").ok().flatten().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+        let live_model_name = v["model"].as_str().unwrap_or("small.en").to_string();
+        let backend = v["backend"].as_str().unwrap_or("cpu").to_string();
+        (mic_name, loop_source, loop_name, live_model_name, backend)
+    };
+    let rec_id = {
+        let conn = state.db.lock().unwrap();
+        db::create_call_recording(&conn, &state.data_dir).map_err(|e| e.to_string())?
+    };
 
     let loopback = resolve_loopback(&loop_source, loop_name)?;
-
     let path = state.data_dir.join("audio").join(format!("call_{rec_id}.wav"));
-    let devices = audio_capture::CaptureDevices { mic_name, loopback };
+
+    // Set up live transcription IF the live whisper model is already on disk.
+    // We don't block capture-start on a multi-GB download — if the model
+    // isn't present, capture proceeds without live transcription and the
+    // finalize pass still produces full output on Stop.
+    let models_dir = state.data_dir.join("models");
+    let live_model_path = models::whisper_path(&models_dir, &live_model_name);
+    let (live_buffer, live_handle) = if live_model_path.exists() {
+        let buf = live::LiveBuffer::new(16_000);
+        let buf_for_capture = buf.clone();
+        let device_index = if backend == "cuda" { 0 } else { -1 };
+        let app_clone = app.clone();
+        let db_owned = std::sync::Arc::new(()); // dummy to align lifetime
+        let _ = db_owned;
+        // The worker closure captures `app` for the Tauri emit + needs DB access via state.
+        let on_segment = move |seg: transcribe::TranscribedSegment| {
+            let app = app_clone.clone();
+            // Insert into DB and emit an event.
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            let _ = db::insert_segment(
+                &conn,
+                rec_id,
+                None,
+                None,
+                seg.start_seconds,
+                seg.end_seconds,
+                &seg.text,
+                seg.confidence,
+            );
+            drop(conn);
+            let _ = app.emit("live-segment", (rec_id, &seg));
+        };
+        let handle = live::spawn_live(buf.clone(), live_model_path, device_index, on_segment);
+        tracing::info!("live transcription enabled with model {live_model_name}");
+        (Some(buf_for_capture), Some(handle))
+    } else {
+        tracing::info!(
+            "live transcription disabled: model {live_model_name} not present at {}; \
+             run the model downloader and try again",
+            live_model_path.display()
+        );
+        let _ = app.emit(
+            "live-status",
+            format!("Live transcription off: model '{live_model_name}' not downloaded yet"),
+        );
+        (None, None)
+    };
+
+    let devices = audio_capture::CaptureDevices { mic_name, loopback, live_buffer };
     let handle = audio_capture::start_call_capture_with(&path, devices).map_err(|e| e.to_string())?;
     *state.capture.lock().unwrap() = Some(handle);
     *state.active_recording.lock().unwrap() = Some(rec_id);
+    *state.live_worker.lock().unwrap() = live_handle;
     Ok(rec_id)
 }
 
@@ -272,6 +332,11 @@ async fn stop_call_capture(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<i64, String> {
+    // Stop the live worker first so it doesn't try to push more rows after
+    // we delete them in the finalize pass.
+    if let Some(h) = state.live_worker.lock().unwrap().take() {
+        h.stop();
+    }
     let handle = state
         .capture
         .lock()
@@ -599,6 +664,7 @@ pub fn run() {
                 active_recording: Mutex::new(None),
                 hardware_cache: Mutex::new(None),
                 last_capture_error: Mutex::new(None),
+                live_worker: Mutex::new(None),
             });
 
             // Start the USB watcher — every plug-in event becomes a

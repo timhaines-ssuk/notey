@@ -66,12 +66,15 @@ impl Default for LoopbackSource {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct CaptureDevices {
     /// Name of the input device (mic) to capture from. `None` → OS default.
     pub mic_name: Option<String>,
     /// Where the right (loopback) channel comes from.
     pub loopback: LoopbackSource,
+    /// Optional sink for live transcription. If set, the capture thread also
+    /// pushes the mono mix (mic+loopback) into this buffer at TARGET_SR.
+    pub live_buffer: Option<crate::live::LiveBuffer>,
 }
 
 pub fn list_devices() -> (Vec<String>, Vec<String>) {
@@ -196,12 +199,12 @@ pub fn start_call_capture_with(out_path: &Path, devices: CaptureDevices) -> Resu
             if stop_rx.recv_timeout(std::time::Duration::from_millis(50)).is_ok() {
                 break;
             }
-            interleave_and_write(&mic_buf, &loop_buf, &writer_for_loop)?;
+            interleave_and_write(&mic_buf, &loop_buf, &writer_for_loop, &devices.live_buffer)?;
         }
 
         drop(mic_stream);
         drop(_loopback_handle);
-        interleave_and_write(&mic_buf, &loop_buf, &writer)?;
+        interleave_and_write(&mic_buf, &loop_buf, &writer, &devices.live_buffer)?;
         if let Some(w) = writer.lock().unwrap().take() {
             w.finalize()?;
         }
@@ -219,6 +222,7 @@ fn interleave_and_write(
     mic_buf: &Arc<Mutex<Vec<f32>>>,
     loop_buf: &Arc<Mutex<Vec<f32>>>,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    live: &Option<crate::live::LiveBuffer>,
 ) -> Result<()> {
     let mut mic = mic_buf.lock().unwrap();
     let mut lp = loop_buf.lock().unwrap();
@@ -235,6 +239,7 @@ fn interleave_and_write(
     let w = w_guard.as_mut().ok_or_else(|| anyhow!("writer closed"))?;
     let mut mic_sq: f64 = 0.0;
     let mut lp_sq: f64 = 0.0;
+    let mut mono = Vec::with_capacity(n);
     for i in 0..n {
         let m = mic_slice[i];
         let l = lp_slice[i];
@@ -242,11 +247,17 @@ fn interleave_and_write(
         lp_sq += (l as f64) * (l as f64);
         w.write_sample(float_to_i16(m))?;
         w.write_sample(float_to_i16(l))?;
+        // Mono mix for the live transcription buffer.
+        mono.push(((m + l) * 0.5).clamp(-1.0, 1.0));
     }
     let mic_rms = ((mic_sq / n as f64).sqrt() * 1000.0) as u64;
     let lp_rms = ((lp_sq / n as f64).sqrt() * 1000.0) as u64;
     LAST_MIC_RMS_X1000.store(mic_rms, Ordering::Relaxed);
     LAST_LOOPBACK_RMS_X1000.store(lp_rms, Ordering::Relaxed);
+
+    if let Some(lb) = live {
+        lb.push(&mono);
+    }
     Ok(())
 }
 
