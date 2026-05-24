@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.vite/
+src-tauri/target/
+src-tauri/gen/
+models/
+*.wav
+*.mp3
+*.partial
+*.log
+.env
+.DS_Store

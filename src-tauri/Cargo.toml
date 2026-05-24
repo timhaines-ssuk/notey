@@ -1,0 +1,91 @@
+[package]
+name = "notetaker"
+version = "0.1.0"
+description = "Local AI Notetaker"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "notetaker_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "notetaker"
+path = "src/main.rs"
+
+[[bin]]
+name = "spike-hwdetect"
+path = "src/bin/spike_hwdetect.rs"
+
+[[bin]]
+name = "spike-asr"
+path = "src/bin/spike_asr.rs"
+
+[[bin]]
+name = "spike-capture"
+path = "src/bin/spike_capture.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+
+# audio
+cpal = "0.15"
+hound = "3.5"
+rubato = "0.16"
+
+# ML — pulled in behind feature flags below so the crate compiles without
+# CUDA/cmake/llvm if the user has not yet installed them.
+whisper-rs = { version = "0.16", optional = true }
+sherpa-rs = { version = "0.6", optional = true }
+
+# storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# system + IO
+sysinfo = "0.31"
+wmi = "0.13"
+windows = { version = "0.58", features = [
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Wmi",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "implement",
+] }
+windows-core = "0.58"
+notify = "6"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
+
+# misc
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Default to a build that compiles without the heavy ML libs; the user opts in
+# once toolchain (clang, cmake, MSVC, optionally CUDA) is installed.
+default = []
+ml = ["dep:whisper-rs", "dep:sherpa-rs"]
+cuda = ["ml", "whisper-rs/cuda", "sherpa-rs/cuda"]
+directml = ["ml", "sherpa-rs/directml"]

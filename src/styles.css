@@ -1,0 +1,113 @@
+:root {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  color-scheme: light dark;
+  background: #1b1c1f;
+  color: #e6e6e6;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; }
+
+#root {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 100vh;
+}
+
+nav.sidebar {
+  background: #141518;
+  border-right: 1px solid #2a2c31;
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+nav.sidebar h1 {
+  font-size: 14px;
+  margin: 0 0 12px 4px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8b8f99;
+}
+
+nav.sidebar button {
+  background: transparent;
+  border: 0;
+  color: #c8ccd2;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+nav.sidebar button.active { background: #2a2c31; color: #fff; }
+nav.sidebar button:hover { background: #23252a; }
+
+main.view {
+  overflow: auto;
+  padding: 24px;
+}
+
+main.view h2 { margin-top: 0; }
+
+.recordings-list { display: flex; flex-direction: column; gap: 8px; }
+.recording-row {
+  padding: 12px;
+  background: #23252a;
+  border-radius: 6px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+}
+.recording-row:hover { background: #2a2c31; }
+.recording-row .meta { color: #8b8f99; font-size: 12px; }
+
+.status-pill {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #3a3d44;
+}
+.status-pill.complete { background: #214d2a; color: #b1e8b5; }
+.status-pill.failed { background: #4d2121; color: #e8b1b1; }
+
+button.primary {
+  background: #3c6eff;
+  color: white;
+  border: 0;
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+button.primary:hover { background: #4d7dff; }
+button.primary:disabled { opacity: 0.5; cursor: default; }
+
+.card {
+  background: #23252a;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.card h3 { margin-top: 0; }
+
+table.kv { width: 100%; border-collapse: collapse; }
+table.kv td { padding: 4px 8px; }
+table.kv td:first-child { color: #8b8f99; width: 200px; }
+
+.hw-gpu { padding: 8px 10px; background: #2a2c31; border-radius: 6px; margin-bottom: 6px; }
+.hw-gpu .name { font-weight: 600; }
+.hw-gpu .detail { color: #8b8f99; font-size: 12px; }
+
+select, input[type="text"] {
+  background: #1b1c1f;
+  color: inherit;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
