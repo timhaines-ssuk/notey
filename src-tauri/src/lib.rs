@@ -29,6 +29,10 @@ pub struct AppState {
     pub last_capture_error: Mutex<Option<String>>,
     pub live_worker: Mutex<Option<live::LiveHandle>>,
     pub monitor: Mutex<Option<monitor::MonitorHandle>>,
+    /// Most recent pipeline-stage event ("transcribing", "complete", ...).
+    /// Set whenever `run_pipeline` emits a `pipeline-stage` event so the UI
+    /// can query state directly instead of relying only on event ordering.
+    pub last_pipeline_stage: Mutex<Option<String>>,
 }
 
 #[tauri::command]
@@ -88,6 +92,8 @@ async fn start_call_capture(app: tauri::AppHandle) -> Result<i64, String> {
     let state = app.state::<AppState>();
     // Free up the cpal devices for the real capture path.
     *state.monitor.lock().unwrap() = None;
+    *state.last_pipeline_stage.lock().unwrap() = None;
+    *state.last_capture_error.lock().unwrap() = None;
     let (mic_name, loop_source, loop_name, live_model_name, backend) = {
         let conn = state.db.lock().unwrap();
         let mic_name = db::get_setting(&conn, "device_mic").ok().flatten().filter(|s| !s.is_empty());
@@ -393,6 +399,10 @@ fn wav_duration_seconds(path: &std::path::Path) -> anyhow::Result<f64> {
     Ok(duration)
 }
 
+fn set_stage(state: &tauri::State<AppState>, s: &str) {
+    *state.last_pipeline_stage.lock().unwrap() = Some(s.to_string());
+}
+
 async fn run_pipeline(
     app: &tauri::AppHandle,
     data_dir: &std::path::Path,
@@ -400,9 +410,11 @@ async fn run_pipeline(
     audio_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
+    set_stage(&state, "resolving-models");
     let _ = app.emit("pipeline-stage", ("resolving-models", rec_id));
     let cfg = pipeline::resolve_config(&state.db, data_dir).await?;
 
+    set_stage(&state, "transcribing");
     let _ = app.emit("pipeline-stage", ("transcribing", rec_id));
     tracing::info!("pipeline: transcribing recording {rec_id}");
     // run_finalize is sync + CPU-bound. We're on a Tauri async-runtime
@@ -410,9 +422,11 @@ async fn run_pipeline(
     // freeze the UI (Tauri uses a multi-thread runtime).
     pipeline::run_finalize(&state.db, rec_id, audio_path, &cfg)?;
 
+    set_stage(&state, "naming");
     let _ = app.emit("pipeline-stage", ("naming", rec_id));
     pipeline::auto_enroll_self(&state.db, rec_id, audio_path, &cfg).ok();
 
+    set_stage(&state, "summarizing");
     let _ = app.emit("pipeline-stage", ("summarizing", rec_id));
     tracing::info!("pipeline: summarizing recording {rec_id}");
     if let Err(e) = pipeline::run_summarize(&state.db, rec_id, &cfg).await {
@@ -426,6 +440,7 @@ async fn run_pipeline(
         let conn = state.db.lock().unwrap();
         let _ = db::update_status(&conn, rec_id, "awaiting_naming");
     }
+    set_stage(&state, "complete");
     let _ = app.emit("pipeline-stage", ("complete", rec_id));
     tracing::info!("pipeline: complete for recording {rec_id}");
     Ok(())
@@ -464,6 +479,34 @@ fn get_rolling_summary(state: tauri::State<AppState>, recording_id: i64) -> Resu
 #[tauri::command]
 fn capture_levels() -> (f32, f32) {
     audio_capture::level_snapshot()
+}
+
+#[derive(serde::Serialize)]
+pub struct CaptureState {
+    /// "idle" | "recording" | "pipeline"
+    state: String,
+    recording_id: Option<i64>,
+    /// Current pipeline stage if any: transcribing / naming / summarizing / complete.
+    pipeline_stage: Option<String>,
+}
+
+#[tauri::command]
+fn get_capture_state(state: tauri::State<AppState>) -> CaptureState {
+    let is_recording = state.capture.lock().unwrap().is_some();
+    let rec_id = *state.active_recording.lock().unwrap();
+    let stage = state.last_pipeline_stage.lock().unwrap().clone();
+    let kind = if is_recording {
+        "recording"
+    } else if rec_id.is_some() && stage.as_deref().map(|s| s != "complete").unwrap_or(false) {
+        "pipeline"
+    } else {
+        "idle"
+    };
+    CaptureState {
+        state: kind.into(),
+        recording_id: rec_id,
+        pipeline_stage: stage,
+    }
 }
 
 #[tauri::command]
@@ -698,6 +741,7 @@ pub fn run() {
                 last_capture_error: Mutex::new(None),
                 live_worker: Mutex::new(None),
                 monitor: Mutex::new(None),
+                last_pipeline_stage: Mutex::new(None),
             });
 
             // Start the USB watcher — every plug-in event becomes a
@@ -728,6 +772,7 @@ pub fn run() {
             capture_levels,
             start_monitor_levels,
             stop_monitor_levels,
+            get_capture_state,
             get_capture_error,
             get_log_dir,
             get_summary,

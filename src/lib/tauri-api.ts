@@ -92,6 +92,12 @@ export const api = {
   captureLevels: () => invoke<[number, number]>("capture_levels"),
   startMonitorLevels: () => invoke<void>("start_monitor_levels"),
   stopMonitorLevels: () => invoke<void>("stop_monitor_levels"),
+  getCaptureState: () =>
+    invoke<{
+      state: "idle" | "recording" | "pipeline";
+      recording_id: number | null;
+      pipeline_stage: string | null;
+    }>("get_capture_state"),
   getCaptureError: () => invoke<string | null>("get_capture_error"),
   logDir: () => invoke<string>("get_log_dir"),
   getSummary: (recordingId: number) =>

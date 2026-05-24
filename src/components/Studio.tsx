@@ -8,12 +8,15 @@ interface AudioSession {
   process_name: string;
 }
 
+type UiState = "idle" | "starting" | "recording" | "stopping" | "pipeline";
+
 export default function Studio({ onOpenRecording }: { onOpenRecording: (id: number) => void }) {
   const [levels, setLevels] = useState<[number, number]>([0, 0]);
-  const [capturing, setCapturing] = useState(false);
+  const [uiState, setUiState] = useState<UiState>("idle");
   const [recId, setRecId] = useState<number | null>(null);
   const [segments, setSegments] = useState<SegmentRow[]>([]);
   const [stage, setStage] = useState<string | null>(null);
+  const capturing = uiState === "recording" || uiState === "starting" || uiState === "stopping";
   const [callApp, setCallApp] = useState<"discord" | "teams" | "none">("none");
   const [err, setErr] = useState<string | null>(null);
   const [liveStatus, setLiveStatus] = useState<string | null>(null);
@@ -38,11 +41,29 @@ export default function Studio({ onOpenRecording }: { onOpenRecording: (id: numb
     };
   }, [capturing, settings.device_mic, settings.device_loopback]);
 
-  // --- Level polling ---
+  // --- Level + state polling ---
   useEffect(() => {
     const t = setInterval(async () => {
       try { setLevels(await api.captureLevels()); } catch {}
-    }, 150);
+      try {
+        const s = await api.getCaptureState();
+        // Reconcile UI state with backend reality. Don't clobber starting/stopping
+        // (those are transient client-only states between click and backend ack).
+        setUiState((prev) => {
+          if (prev === "starting") {
+            return s.state === "recording" ? "recording" : prev;
+          }
+          if (prev === "stopping") {
+            return s.state === "recording" ? prev : (s.state === "pipeline" ? "pipeline" : "idle");
+          }
+          if (s.state === "recording") return "recording";
+          if (s.state === "pipeline") return "pipeline";
+          return "idle";
+        });
+        if (s.recording_id) setRecId(s.recording_id);
+        if (s.pipeline_stage) setStage(s.pipeline_stage);
+      } catch {}
+    }, 200);
     return () => clearInterval(t);
   }, []);
 
@@ -129,21 +150,28 @@ export default function Studio({ onOpenRecording }: { onOpenRecording: (id: numb
   async function toggleCapture() {
     setErr(null);
     setLiveStatus(null);
-    try {
-      if (capturing) {
+    if (uiState === "starting" || uiState === "stopping") return; // ignore double-click
+
+    if (uiState === "recording") {
+      setUiState("stopping");
+      startedAt.current = null;
+      try {
         await api.stopCallCapture();
-        setCapturing(false);
-        // recId stays set so transcript continues to refresh through pipeline
-        startedAt.current = null;
-      } else {
-        setSegments([]);
+      } catch (e) {
+        setErr(String(e));
+        // Re-poll will resync state on next interval.
+      }
+    } else {
+      setUiState("starting");
+      setSegments([]);
+      try {
         const id = await api.startCallCapture();
         setRecId(id);
-        setCapturing(true);
         setStage("recording");
+      } catch (e) {
+        setErr(String(e));
+        setUiState("idle");
       }
-    } catch (e) {
-      setErr(String(e));
     }
   }
 
@@ -169,13 +197,7 @@ export default function Studio({ onOpenRecording }: { onOpenRecording: (id: numb
                   {fmtDuration(duration)}
                 </span>
               )}
-              <button
-                className="primary"
-                style={{ minWidth: 140, fontWeight: "bold" }}
-                onClick={toggleCapture}
-              >
-                {capturing ? "■ Stop" : "● Start capture"}
-              </button>
+              <CaptureButton state={uiState} onClick={toggleCapture} />
             </div>
           </div>
         </div>
@@ -311,6 +333,50 @@ export default function Studio({ onOpenRecording }: { onOpenRecording: (id: numb
         </div>
       </div>
     </div>
+  );
+}
+
+function CaptureButton({ state, onClick }: { state: UiState; onClick: () => void }) {
+  // Each state gets a distinct colour so the user knows the backend has
+  // actually acknowledged their click — `starting` and `stopping` are
+  // intermediate UI states we hold until get_capture_state confirms.
+  const presets: Record<UiState, { bg: string; label: string; pulse: boolean; disabled: boolean }> = {
+    idle:      { bg: "#3c6eff", label: "● Start capture", pulse: false, disabled: false },
+    starting:  { bg: "#d0a52a", label: "Starting…",        pulse: true,  disabled: true  },
+    recording: { bg: "#c33a3a", label: "■ Stop recording", pulse: true,  disabled: false },
+    stopping:  { bg: "#d0a52a", label: "Stopping…",        pulse: true,  disabled: true  },
+    pipeline:  { bg: "#2a6e6e", label: "Processing…",      pulse: true,  disabled: true  },
+  };
+  const p = presets[state];
+  return (
+    <>
+      <style>{`
+        @keyframes notetaker-pulse {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0.0); transform: scale(1); }
+          50%      { box-shadow: 0 0 0 6px rgba(255,255,255,0.18); transform: scale(1.02); }
+        }
+      `}</style>
+      <button
+        onClick={onClick}
+        disabled={p.disabled}
+        style={{
+          background: p.bg,
+          color: "white",
+          border: 0,
+          padding: "10px 18px",
+          borderRadius: 8,
+          cursor: p.disabled ? "default" : "pointer",
+          fontWeight: 700,
+          fontSize: 14,
+          minWidth: 170,
+          animation: p.pulse ? "notetaker-pulse 1.4s ease-in-out infinite" : undefined,
+          opacity: p.disabled ? 0.85 : 1,
+          transition: "background 120ms",
+        }}
+      >
+        {p.label}
+      </button>
+    </>
   );
 }
 
