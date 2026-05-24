@@ -8,6 +8,7 @@ pub mod hardware;
 pub mod ingest;
 pub mod live;
 pub mod models;
+pub mod monitor;
 pub mod pipeline;
 #[cfg(target_os = "windows")]
 pub mod proc_loopback;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub hardware_cache: Mutex<Option<hardware::HardwareProfile>>,
     pub last_capture_error: Mutex<Option<String>>,
     pub live_worker: Mutex<Option<live::LiveHandle>>,
+    pub monitor: Mutex<Option<monitor::MonitorHandle>>,
 }
 
 #[tauri::command]
@@ -84,6 +86,8 @@ fn confirm_speaker(
 #[tauri::command]
 async fn start_call_capture(app: tauri::AppHandle) -> Result<i64, String> {
     let state = app.state::<AppState>();
+    // Free up the cpal devices for the real capture path.
+    *state.monitor.lock().unwrap() = None;
     let (mic_name, loop_source, loop_name, live_model_name, backend) = {
         let conn = state.db.lock().unwrap();
         let mic_name = db::get_setting(&conn, "device_mic").ok().flatten().filter(|s| !s.is_empty());
@@ -463,6 +467,34 @@ fn capture_levels() -> (f32, f32) {
 }
 
 #[tauri::command]
+fn start_monitor_levels(state: tauri::State<AppState>) -> Result<(), String> {
+    // No-op if already capturing (real capture is already pushing levels) or
+    // already monitoring.
+    if state.capture.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    if state.monitor.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    let (mic_name, loop_name) = {
+        let conn = state.db.lock().unwrap();
+        let mic = db::get_setting(&conn, "device_mic").ok().flatten().filter(|s| !s.is_empty());
+        let lp = db::get_setting(&conn, "device_loopback").ok().flatten().filter(|s| !s.is_empty());
+        (mic, lp)
+    };
+    let h = monitor::start_monitor(mic_name.as_deref(), loop_name.as_deref())
+        .map_err(|e| e.to_string())?;
+    *state.monitor.lock().unwrap() = Some(h);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_monitor_levels(state: tauri::State<AppState>) -> Result<(), String> {
+    *state.monitor.lock().unwrap() = None;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_capture_error(state: tauri::State<AppState>) -> Option<String> {
     let cap = state.capture.lock().unwrap();
     if let Some(h) = cap.as_ref() {
@@ -665,6 +697,7 @@ pub fn run() {
                 hardware_cache: Mutex::new(None),
                 last_capture_error: Mutex::new(None),
                 live_worker: Mutex::new(None),
+                monitor: Mutex::new(None),
             });
 
             // Start the USB watcher — every plug-in event becomes a
@@ -693,6 +726,8 @@ pub fn run() {
             models_status,
             download_models,
             capture_levels,
+            start_monitor_levels,
+            stop_monitor_levels,
             get_capture_error,
             get_log_dir,
             get_summary,

@@ -90,6 +90,8 @@ export const api = {
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   captureLevels: () => invoke<[number, number]>("capture_levels"),
+  startMonitorLevels: () => invoke<void>("start_monitor_levels"),
+  stopMonitorLevels: () => invoke<void>("stop_monitor_levels"),
   getCaptureError: () => invoke<string | null>("get_capture_error"),
   logDir: () => invoke<string>("get_log_dir"),
   getSummary: (recordingId: number) =>

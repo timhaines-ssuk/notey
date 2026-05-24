@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, RecordingRow } from "../lib/tauri-api";
 import { manualImport } from "./DevicePluggedDialog";
 
@@ -8,6 +9,22 @@ export default function RecordingsList({ onOpen }: { onOpen: (id: number) => voi
   const [err, setErr] = useState<string | null>(null);
   const [levels, setLevels] = useState<[number, number]>([0, 0]);
   const [callApp, setCallApp] = useState<"discord" | "teams" | "none">("none");
+  const [liveStatus, setLiveStatus] = useState<string | null>(null);
+  const [liveCount, setLiveCount] = useState(0);
+  const [activeRecId, setActiveRecId] = useState<number | null>(null);
+
+  useEffect(() => {
+    const unStatus = listen<string>("live-status", (e) => setLiveStatus(e.payload));
+    const unSeg = listen<[number, unknown]>("live-segment", (e) => {
+      const [rid] = e.payload as any;
+      setLiveCount((c) => c + 1);
+      setActiveRecId(rid);
+    });
+    return () => {
+      unStatus.then((u) => u());
+      unSeg.then((u) => u());
+    };
+  }, []);
 
   useEffect(() => {
     const t = setInterval(async () => {
@@ -50,9 +67,15 @@ export default function RecordingsList({ onOpen }: { onOpen: (id: number) => voi
       if (capturing) {
         await api.stopCallCapture();
         setCapturing(false);
+        setLiveStatus(null);
+        setLiveCount(0);
       } else {
-        await api.startCallCapture();
+        const newId = await api.startCallCapture();
         setCapturing(true);
+        setLiveCount(0);
+        setActiveRecId(newId);
+        // Auto-open the transcript view so live segments are visible.
+        onOpen(newId);
       }
       refresh();
     } catch (e) {
@@ -91,9 +114,35 @@ export default function RecordingsList({ onOpen }: { onOpen: (id: number) => voi
           <strong>Capturing.</strong> Talk and play audio to verify both meters are moving:
           <Meter label="Mic (you)" value={levels[0]} />
           <Meter label="System audio (Discord/Teams)" value={levels[1]} />
+          {levels[0] < 0.005 && (
+            <div style={{ color: "#e8b1b1", marginTop: 4 }}>
+              Mic meter is flat. Check Settings → Audio (right mic selected? mic muted in Windows or Discord?).
+            </div>
+          )}
           {levels[1] < 0.005 && (
             <div style={{ color: "#e8b1b1", marginTop: 4 }}>
-              System audio meter is flat — check that Windows' default playback device matches where Discord is playing.
+              System audio meter is flat — Windows' default playback device or process selection may not match where Discord is playing.
+            </div>
+          )}
+          {liveStatus && (
+            <div style={{ color: "#e8b1b1", marginTop: 4 }}>{liveStatus}</div>
+          )}
+          {!liveStatus && liveCount === 0 && (
+            <div style={{ color: "#8b8f99", marginTop: 4, fontSize: 12 }}>
+              Live transcription will appear in the transcript view (live windows are 8s long, first segment lands ~10s in). Open the recording row below to watch.
+            </div>
+          )}
+          {liveCount > 0 && activeRecId && (
+            <div style={{ marginTop: 4, fontSize: 12 }}>
+              <strong>{liveCount}</strong> live segment(s) so far —
+              {" "}
+              <a
+                href="#"
+                onClick={(e) => { e.preventDefault(); onOpen(activeRecId); }}
+                style={{ color: "#3c6eff" }}
+              >
+                open transcript →
+              </a>
             </div>
           )}
         </div>

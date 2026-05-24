@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import Studio from "./components/Studio";
 import RecordingsList from "./components/RecordingsList";
 import TranscriptViewer from "./components/TranscriptViewer";
 import SettingsHardware from "./components/SettingsHardware";
@@ -10,6 +11,7 @@ import { api } from "./lib/tauri-api";
 
 type View =
   | { kind: "models" }
+  | { kind: "studio" }
   | { kind: "recordings" }
   | { kind: "transcript"; recordingId: number }
   | { kind: "settings-hardware" }
@@ -28,9 +30,9 @@ export default function App() {
           s.whisper_finalize_present &&
           s.sherpa_segmentation_present &&
           s.sherpa_embedding_present;
-        setView(ok ? { kind: "recordings" } : { kind: "models" });
+        setView(ok ? { kind: "studio" } : { kind: "models" });
       })
-      .catch(() => setView({ kind: "recordings" }));
+      .catch(() => setView({ kind: "studio" }));
   }, []);
 
   if (!view) return null;
@@ -39,6 +41,12 @@ export default function App() {
     <>
       <nav className="sidebar">
         <h1>Notetaker</h1>
+        <button
+          className={view.kind === "studio" ? "active" : ""}
+          onClick={() => setView({ kind: "studio" })}
+        >
+          Studio
+        </button>
         <button
           className={view.kind === "recordings" || view.kind === "transcript" ? "active" : ""}
           onClick={() => setView({ kind: "recordings" })}
@@ -72,7 +80,10 @@ export default function App() {
       </nav>
       <main className="view">
         {view.kind === "models" && (
-          <ModelDownloader onDone={() => setView({ kind: "recordings" })} />
+          <ModelDownloader onDone={() => setView({ kind: "studio" })} />
+        )}
+        {view.kind === "studio" && (
+          <Studio onOpenRecording={(id) => setView({ kind: "transcript", recordingId: id })} />
         )}
         {view.kind === "recordings" && (
           <RecordingsList onOpen={(id) => setView({ kind: "transcript", recordingId: id })} />
@@ -80,7 +91,7 @@ export default function App() {
         {view.kind === "transcript" && (
           <TranscriptViewer
             recordingId={view.recordingId}
-            onBack={() => setView({ kind: "recordings" })}
+            onBack={() => setView({ kind: "studio" })}
           />
         )}
         {view.kind === "settings-audio" && <SettingsAudio />}
