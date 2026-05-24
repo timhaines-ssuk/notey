@@ -90,6 +90,12 @@ export const api = {
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   captureLevels: () => invoke<[number, number]>("capture_levels"),
+  getCaptureError: () => invoke<string | null>("get_capture_error"),
+  logDir: () => invoke<string>("get_log_dir"),
+  getSummary: (recordingId: number) =>
+    invoke<string | null>("get_summary", { recordingId }),
+  getRollingSummary: (recordingId: number) =>
+    invoke<string | null>("get_rolling_summary", { recordingId }),
   detectCallApp: () => invoke<"discord" | "teams" | "none">("detect_call_app"),
   listAudioDevices: () =>
     invoke<{

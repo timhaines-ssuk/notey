@@ -32,6 +32,11 @@ const TARGET_SR: u32 = 16_000;
 pub struct CaptureHandle {
     stop_tx: Sender<()>,
     join: Option<JoinHandle<Result<PathBuf>>>,
+    /// Set by the capture thread if process-loopback (or anything else)
+    /// failed AFTER the initial start_call_capture() returned. The UI polls
+    /// this via the `get_capture_error` command so the user finds out before
+    /// they hit Stop.
+    pub async_error: Arc<Mutex<Option<String>>>,
 }
 
 impl CaptureHandle {
@@ -98,8 +103,11 @@ pub fn start_call_capture(out_path: &Path) -> Result<CaptureHandle> {
 pub fn start_call_capture_with(out_path: &Path, devices: CaptureDevices) -> Result<CaptureHandle> {
     let out_path = out_path.to_path_buf();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let async_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let async_error_thread = async_error.clone();
 
     let join = std::thread::spawn(move || -> Result<PathBuf> {
+        let _ae = async_error_thread.clone();
         if let Some(p) = out_path.parent() {
             std::fs::create_dir_all(p).ok();
         }
@@ -143,9 +151,15 @@ pub fn start_call_capture_with(out_path: &Path, devices: CaptureDevices) -> Resu
                 let loop_buf_clone = loop_buf.clone();
                 let src_sr_slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
                 let src_sr_set = src_sr_slot.clone();
+                let ae_for_proc = _ae.clone();
                 let h = crate::proc_loopback::start_capture(
                     pid,
                     move |fmt| {
+                        tracing::info!(
+                            "process loopback format: {} ch, {} Hz",
+                            fmt.channels,
+                            fmt.sample_rate
+                        );
                         *src_sr_set.lock().unwrap() = Some(fmt.sample_rate);
                     },
                     move |frames, channels| {
@@ -164,6 +178,9 @@ pub fn start_call_capture_with(out_path: &Path, devices: CaptureDevices) -> Resu
                             linear_resample(&mono, src_sr, TARGET_SR)
                         };
                         loop_buf_clone.lock().unwrap().extend(resampled);
+                    },
+                    move |err| {
+                        *ae_for_proc.lock().unwrap() = Some(err);
                     },
                 )?;
                 LoopbackHandle::Process(h)
@@ -194,6 +211,7 @@ pub fn start_call_capture_with(out_path: &Path, devices: CaptureDevices) -> Resu
     Ok(CaptureHandle {
         stop_tx,
         join: Some(join),
+        async_error,
     })
 }
 

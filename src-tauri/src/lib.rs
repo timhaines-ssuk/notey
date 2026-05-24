@@ -25,6 +25,7 @@ pub struct AppState {
     pub capture: Mutex<Option<audio_capture::CaptureHandle>>,
     pub active_recording: Mutex<Option<i64>>,
     pub hardware_cache: Mutex<Option<hardware::HardwareProfile>>,
+    pub last_capture_error: Mutex<Option<String>>,
 }
 
 #[tauri::command]
@@ -277,6 +278,13 @@ async fn stop_call_capture(
         .unwrap()
         .take()
         .ok_or_else(|| "no active capture".to_string())?;
+    // Snapshot any async error before stopping so it isn't lost.
+    let async_err = handle.async_error.lock().unwrap().clone();
+    if let Some(e) = async_err {
+        *state.last_capture_error.lock().unwrap() = Some(e);
+    } else {
+        *state.last_capture_error.lock().unwrap() = None;
+    }
     let path = handle.stop().map_err(|e| e.to_string())?;
     let rec_id = state
         .active_recording
@@ -323,25 +331,89 @@ async fn run_pipeline(
     audio_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
+    let _ = app.emit("pipeline-stage", ("resolving-models", rec_id));
     let cfg = pipeline::resolve_config(&state.db, data_dir).await?;
 
     let _ = app.emit("pipeline-stage", ("transcribing", rec_id));
+    tracing::info!("pipeline: transcribing recording {rec_id}");
+    // run_finalize is sync + CPU-bound. We're on a Tauri async-runtime
+    // thread; this stalls that one worker for the duration but doesn't
+    // freeze the UI (Tauri uses a multi-thread runtime).
     pipeline::run_finalize(&state.db, rec_id, audio_path, &cfg)?;
-    let _ = app.emit("pipeline-stage", ("naming", rec_id));
 
-    // Mic auto-enroll: channel 0 (left = mic) is always "You". The mic cluster
-    // is the one whose segments fall predominantly in channel 0; for stereo
-    // mic-on-L / loopback-on-R recordings we detect that by checking the
-    // mic-channel transcript pass.
+    let _ = app.emit("pipeline-stage", ("naming", rec_id));
     pipeline::auto_enroll_self(&state.db, rec_id, audio_path, &cfg).ok();
 
+    let _ = app.emit("pipeline-stage", ("summarizing", rec_id));
+    tracing::info!("pipeline: summarizing recording {rec_id}");
+    if let Err(e) = pipeline::run_summarize(&state.db, rec_id, &cfg).await {
+        // Don't fail the whole pipeline if summarization is unavailable
+        // (Ollama not running, model not pulled, etc).
+        tracing::warn!("summarization failed for {rec_id}: {e:#}");
+        let _ = app.emit("summarize-error", format!("{rec_id}: {e:#}"));
+    }
+
+    {
+        let conn = state.db.lock().unwrap();
+        let _ = db::update_status(&conn, rec_id, "awaiting_naming");
+    }
     let _ = app.emit("pipeline-stage", ("complete", rec_id));
+    tracing::info!("pipeline: complete for recording {rec_id}");
     Ok(())
+}
+
+#[tauri::command]
+fn get_summary(state: tauri::State<AppState>, recording_id: i64) -> Result<Option<String>, String> {
+    let conn = state.db.lock().unwrap();
+    conn.query_row(
+        "SELECT text FROM summaries WHERE recording_id = ?1",
+        rusqlite::params![recording_id],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other.to_string()),
+    })
+}
+
+#[tauri::command]
+fn get_rolling_summary(state: tauri::State<AppState>, recording_id: i64) -> Result<Option<String>, String> {
+    let conn = state.db.lock().unwrap();
+    conn.query_row(
+        "SELECT text FROM rolling_summary WHERE recording_id = ?1",
+        rusqlite::params![recording_id],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other.to_string()),
+    })
 }
 
 #[tauri::command]
 fn capture_levels() -> (f32, f32) {
     audio_capture::level_snapshot()
+}
+
+#[tauri::command]
+fn get_capture_error(state: tauri::State<AppState>) -> Option<String> {
+    let cap = state.capture.lock().unwrap();
+    if let Some(h) = cap.as_ref() {
+        if let Some(err) = h.async_error.lock().unwrap().as_ref() {
+            return Some(err.clone());
+        }
+    }
+    state.last_capture_error.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_log_dir() -> String {
+    dirs::data_local_dir()
+        .map(|d| d.join("com.notetaker.app"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -484,7 +556,28 @@ async fn ensure_sherpa_with_progress<F: Fn(models::DownloadProgress) + Send + Cl
 }
 
 pub fn run() {
-    tracing_subscriber::fmt::init();
+    // Log path is whatever Tauri picks for app_data_dir — we'd love to use it
+    // here, but app_data_dir() needs the app handle. So write to a stable
+    // location (LocalAppData) and let the app print the resolved path on first
+    // launch.
+    let log_dir = dirs::data_local_dir()
+        .map(|d| d.join("com.notetaker.app"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "notetaker.log");
+    let (nb_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    // Leak the guard so it lives for the program lifetime.
+    Box::leak(Box::new(_guard));
+
+    use tracing_subscriber::EnvFilter;
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("notetaker=debug,notetaker_lib=debug,info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(nb_writer)
+        .with_env_filter(env_filter)
+        .with_ansi(false)
+        .try_init();
+    tracing::info!(?log_dir, "notetaker starting");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -505,6 +598,7 @@ pub fn run() {
                 capture: Mutex::new(None),
                 active_recording: Mutex::new(None),
                 hardware_cache: Mutex::new(None),
+                last_capture_error: Mutex::new(None),
             });
 
             // Start the USB watcher — every plug-in event becomes a
@@ -533,6 +627,10 @@ pub fn run() {
             models_status,
             download_models,
             capture_levels,
+            get_capture_error,
+            get_log_dir,
+            get_summary,
+            get_rolling_summary,
             detect_call_app,
             list_audio_devices,
             list_audio_sessions,

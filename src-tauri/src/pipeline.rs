@@ -8,17 +8,29 @@ pub struct ModelConfig {
     pub diarize_segmentation_path: PathBuf,
     pub diarize_embedding_path: PathBuf,
     pub device_index: i32,
+    pub ollama_url: String,
+    pub ollama_model: String,
 }
 
 pub async fn resolve_config(db: &Mutex<Connection>, data_dir: &Path) -> Result<ModelConfig> {
-    let (finalize_name, backend) = {
+    let (finalize_name, backend, ollama_url, ollama_model) = {
         let conn = db.lock().unwrap();
         let raw = crate::db::get_setting(&conn, "transcribe_finalize")?
             .ok_or_else(|| anyhow!("transcribe_finalize setting missing"))?;
         let v: serde_json::Value = serde_json::from_str(&raw)?;
         let model = v["model"].as_str().unwrap_or("medium.en").to_string();
         let backend = v["backend"].as_str().unwrap_or("cpu").to_string();
-        (model, backend)
+
+        let url = crate::db::get_setting(&conn, "ollama_url")?
+            .unwrap_or_else(|| "http://localhost:11434".into());
+
+        let summ = crate::db::get_setting(&conn, "summarize")?.unwrap_or_default();
+        let summ_model = serde_json::from_str::<serde_json::Value>(&summ)
+            .ok()
+            .and_then(|v| v["model"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "qwen2.5:7b".into());
+
+        (model, backend, url, summ_model)
     };
     let models_dir = data_dir.join("models");
     let whisper_finalize_path = crate::models::ensure_whisper(&models_dir, &finalize_name).await?;
@@ -29,6 +41,8 @@ pub async fn resolve_config(db: &Mutex<Connection>, data_dir: &Path) -> Result<M
         diarize_segmentation_path: seg,
         diarize_embedding_path: emb,
         device_index,
+        ollama_url,
+        ollama_model,
     })
 }
 
@@ -223,6 +237,102 @@ pub fn auto_enroll_self(
     // Don't ignore device-index, but cfg isn't used here except to signal CUDA;
     // future: re-extract Self embedding on each call to keep it tight.
     let _ = cfg;
+    Ok(())
+}
+
+/// Run summarization over the segments of a finished recording:
+///   - rolling 5-minute chunks → `summary_chunks` rows
+///   - cumulative running summary → `rolling_summary`
+///   - final clean summary built from the chunks → `summaries`
+pub async fn run_summarize(
+    db: &Mutex<Connection>,
+    recording_id: i64,
+    cfg: &ModelConfig,
+) -> Result<()> {
+    let segments = {
+        let conn = db.lock().unwrap();
+        crate::db::get_segments(&conn, recording_id)?
+    };
+    if segments.is_empty() {
+        return Ok(());
+    }
+
+    let chunks = crate::summarize::group_into_chunks(&segments);
+    let mut chunk_bullets: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut rolling = String::new();
+
+    for (start, end, segs) in chunks {
+        let lines = crate::summarize::format_segments_for_prompt(segs);
+        if lines.trim().is_empty() {
+            continue;
+        }
+        let bullets = crate::summarize::ollama_generate(
+            &cfg.ollama_url,
+            &cfg.ollama_model,
+            &crate::summarize::chunk_prompt(&lines),
+        )
+        .await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO summary_chunks(recording_id, start_seconds, end_seconds, text, generated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![recording_id, start, end, bullets, now],
+            )?;
+        }
+        chunk_bullets.push(bullets.clone());
+
+        // Update rolling summary
+        rolling = crate::summarize::ollama_generate(
+            &cfg.ollama_url,
+            &cfg.ollama_model,
+            &crate::summarize::rolling_prompt(&rolling, &bullets),
+        )
+        .await?;
+        {
+            let conn = db.lock().unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO rolling_summary(recording_id, text, through_seconds, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(recording_id) DO UPDATE SET
+                   text = excluded.text,
+                   through_seconds = excluded.through_seconds,
+                   updated_at = excluded.updated_at",
+                rusqlite::params![recording_id, rolling, end, now],
+            )?;
+        }
+    }
+
+    let speakers: Vec<String> = {
+        let mut s: Vec<String> = segments.iter().filter_map(|s| s.speaker_name.clone()).collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+
+    let final_text = if chunk_bullets.is_empty() {
+        rolling.clone()
+    } else {
+        crate::summarize::ollama_generate(
+            &cfg.ollama_url,
+            &cfg.ollama_model,
+            &crate::summarize::final_prompt(&chunk_bullets.join("\n\n"), &speakers),
+        )
+        .await?
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO summaries(recording_id, text, model, generated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(recording_id) DO UPDATE SET
+           text = excluded.text, model = excluded.model, generated_at = excluded.generated_at",
+        rusqlite::params![recording_id, final_text, cfg.ollama_model, now],
+    )?;
     Ok(())
 }
 

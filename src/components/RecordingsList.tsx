@@ -24,6 +24,8 @@ export default function RecordingsList({ onOpen }: { onOpen: (id: number) => voi
     const t = setInterval(async () => {
       try {
         setLevels(await api.captureLevels());
+        const e = await api.getCaptureError();
+        if (e) setErr(e);
       } catch {}
     }, 200);
     return () => clearInterval(t);

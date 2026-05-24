@@ -181,6 +181,13 @@ export default function SettingsAudio() {
       <div className="card" style={{ color: "#8b8f99" }}>
         Tip: after picking a source, click <em>Start call capture</em> on the Recordings page and
         watch the two meters — both should move when you talk and when audio plays.
+        <div style={{ marginTop: 8 }}>
+          <button onClick={async () => {
+            const dir = await api.logDir();
+            await navigator.clipboard.writeText(dir);
+            alert(`Log folder copied to clipboard:\n${dir}\n\nThe daily log is in there as notetaker.log.YYYY-MM-DD.`);
+          }}>Copy log-folder path</button>
+        </div>
       </div>
     </>
   );

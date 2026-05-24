@@ -118,10 +118,15 @@ pub struct ProcessLoopbackFormat {
 /// Start process-loopback capture for the given target PID, including its
 /// whole process tree (Discord and Teams both have helper processes that
 /// actually render audio).
+///
+/// `on_error` is called from the capture thread if activation fails *after*
+/// `start_capture` itself has already returned — useful for the UI to surface
+/// the problem instead of recording silence.
 pub fn start_capture<F>(
     target_pid: u32,
     on_format: impl FnOnce(ProcessLoopbackFormat) + Send + 'static,
     mut on_frames: F,
+    on_error: impl FnOnce(String) + Send + 'static,
 ) -> Result<ProcessLoopbackHandle>
 where
     F: FnMut(&[f32], u32) + Send + 'static,
@@ -133,7 +138,9 @@ where
         .name("proc-loopback".into())
         .spawn(move || {
             if let Err(e) = run(target_pid, stop_thread, on_format, &mut on_frames) {
-                tracing::error!("process loopback failed: {e:?}");
+                let msg = format!("process loopback failed: {e:#}");
+                tracing::error!("{msg}");
+                on_error(msg);
             }
         })?;
 
